@@ -1,0 +1,7 @@
+data/
+models/
+saved_models/
+*.png
+*.jpg
+*.jpeg
+*.gif
