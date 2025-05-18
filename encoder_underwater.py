@@ -9,26 +9,27 @@ class UnderwaterEncoder(nn.Module):
         self.feature_extractor = nn.Sequential(
             nn.Linear(2, 32),
             nn.ReLU(),
+            nn.LayerNorm(32),  # Add batch normalization
             nn.Dropout(0.2),
             nn.Linear(32, 64),
             nn.ReLU(),
+            nn.LayerNorm(64),  # Add batch normalization
             nn.Dropout(0.2)
         )
         
         # Process channel summary features
         self.summary_processor = nn.Sequential(
-            nn.Linear(4, 16),
+            nn.Linear(5, 16),  # Updated for 5 features
             nn.ReLU(),
+            nn.LayerNorm(16),  # Add batch normalization
             nn.Dropout(0.2)
         )
-        
-        # Global pooling for variable number of taps
-        self.global_pooling = nn.AdaptiveAvgPool1d(1)
         
         # Final regression layer
         self.regressor = nn.Sequential(
             nn.Linear(64 + 16, 32),
             nn.ReLU(),
+            nn.LayerNorm(32),  # Add batch normalization
             nn.Dropout(0.2),
             nn.Linear(32, 1)  # Output distance estimate
         )
@@ -79,35 +80,37 @@ class UnderwaterEncoderWithPrior(nn.Module):
         self.feature_extractor = nn.Sequential(
             nn.Linear(2, 32),
             nn.ReLU(),
+            nn.LayerNorm(32),
             nn.Dropout(0.2),
             nn.Linear(32, 64),
             nn.ReLU(),
+            nn.LayerNorm(64),
             nn.Dropout(0.2)
         )
         
         # Process channel summary features
         self.summary_processor = nn.Sequential(
-            nn.Linear(4, 16),
+            nn.Linear(5, 16),  # Updated for 5 features
             nn.ReLU(),
+            nn.LayerNorm(16),
             nn.Dropout(0.2)
         )
         
-        # Process prior state information (only distance)
+        # Process prior state information
         self.prior_processor = nn.Sequential(
-            nn.Linear(1, 16),  # Takes state vector [distance]
+            nn.Linear(1, 16),
             nn.ReLU(),
+            nn.LayerNorm(16),
             nn.Dropout(0.2)
         )
-        
-        # Global pooling for variable number of taps
-        self.global_pooling = nn.AdaptiveAvgPool1d(1)
         
         # Final regression layer
         self.regressor = nn.Sequential(
-            nn.Linear(64 + 16 + 16, 32),  # +16 for prior features
+            nn.Linear(64 + 16 + 16, 32),
             nn.ReLU(),
+            nn.LayerNorm(32),
             nn.Dropout(0.2),
-            nn.Linear(32, 1)  # Output distance estimate
+            nn.Linear(32, 1)
         )
     
     def forward(self, x, prior):

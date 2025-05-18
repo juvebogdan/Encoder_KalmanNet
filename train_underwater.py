@@ -16,16 +16,11 @@ from encoder_underwater import UnderwaterEncoder, UnderwaterEncoderWithPrior
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Set random seed for reproducibility
-# torch.manual_seed(42)
-# np.random.seed(42)
-# random.seed(42)
-
 def custom_collate(batch):
     """Custom collate function to handle variable-length amplitude/delay arrays"""
     # Extract components
     basic_features = [item[0][0] for item in batch]  # List of tensors with shape [num_arrivals, 2]
-    summary_features = torch.stack([item[0][1] for item in batch])  # Shape: [batch_size, 4]
+    summary_features = torch.stack([item[0][1] for item in batch])  # Shape: [batch_size, 5] (now with 5 features)
     targets = torch.stack([item[1] for item in batch])  # Shape: [batch_size, 1]
     
     # Find max number of arrivals in this batch
@@ -43,13 +38,13 @@ def custom_collate(batch):
     
     return (padded_features, mask, summary_features), targets
 
-def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=0.003):
-    """Train the basic encoder model"""
+def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=0.003, weight_decay=0.0001):
+    """Train the basic encoder model with L2 regularization"""
     model = model.to(device)
     
     # Loss and optimizer
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
     # Training history
     train_losses = []
@@ -124,7 +119,7 @@ def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=
     
     return model, train_losses, val_losses
 
-def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectories, num_epochs=50, learning_rate=0.003, batch_size=32, noise_scale=0.05):
+def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectories, num_epochs=50, learning_rate=0.003, batch_size=32, noise_scale=0.05, weight_decay=0.0001):
     """
     Train the encoder with prior using ground truth + noise as prior
     
@@ -137,12 +132,13 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
     - learning_rate: Learning rate for optimizer
     - batch_size: How many trajectories to process before updating weights
     - noise_scale: Amount of noise to add to ground truth (as percentage)
+    - weight_decay: L2 regularization parameter
     """
     model = model.to(device)
     
     # Loss and optimizer
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
     # Training history
     train_losses = []
@@ -185,7 +181,7 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
             for step in range(len(indices)):
                 idx = indices[step]
                 
-                # Get data point
+                # Get data point - now these are normalized
                 (basic_features, summary_features), target = dataset[idx]
                 
                 # Create mask for single item
@@ -197,13 +193,14 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
                 summary_features = summary_features.unsqueeze(0).to(device)
                 target = target.unsqueeze(0).to(device)
                 
-                # Generate prior using ground truth + noise
+                # Generate prior using normalized target + noise
                 prior = torch.zeros(1, 1).to(device)
-                noise = torch.randn(1).to(device) * noise_scale * target.item()
+                # Add noise directly to the normalized target
+                noise = torch.randn(1).to(device) * noise_scale
                 prior[0, 0] = target.item() + noise
                 
-                # Ensure prior is positive (if distance can't be negative)
-                prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
+                # Ensure prior is within reasonable bounds (-3 to +3 std is reasonable for normalized data)
+                prior[0, 0] = torch.clamp(prior[0, 0], min=-3.0, max=3.0)
                 
                 # Forward pass
                 output = model((basic_features, mask, summary_features), prior)
@@ -246,7 +243,7 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
                 for step in range(len(indices)):
                     idx = indices[step]
                     
-                    # Get data point
+                    # Get data point - normalized
                     (basic_features, summary_features), target = dataset[idx]
                     
                     # Create mask for single item
@@ -258,10 +255,12 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
                     summary_features = summary_features.unsqueeze(0).to(device)
                     target = target.unsqueeze(0).to(device)
                     
-                    # Generate prior using ground truth + noise (same as training)
+                    # Generate prior using normalized target + noise (same as training)
                     prior = torch.zeros(1, 1).to(device)
-                    noise = torch.randn(1).to(device) * noise_scale * target.item()
+                    noise = torch.randn(1).to(device) * noise_scale
                     prior[0, 0] = target.item() + noise
+                    prior[0, 0] = torch.clamp(prior[0, 0], min=-3.0, max=3.0)
+                    prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
                     prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
                     
                     # Forward pass
@@ -303,7 +302,7 @@ def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectorie
 
 def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_scale=0.05):
     """
-    Evaluate model performance on test trajectories with proper state transition
+    Evaluate model performance on test trajectories
     
     Parameters:
     - model: Encoder model (with or without prior)
@@ -337,10 +336,6 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
         print("ERROR: No test trajectories found. Cannot evaluate model.")
         return 0, 0, 0, [], []
     
-    # Constants for state transition
-    delta_t = 1.0  # Time step in seconds (adjust if your sampling rate is different)
-    velocity = 1.0  # Constant velocity in m/s
-    
     # Select a few trajectories to visualize (first 3 for simplicity)
     trajectories_to_visualize = test_traj_ids[:3] if len(test_traj_ids) >= 3 else test_traj_ids
     
@@ -350,7 +345,6 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
             indices = test_trajectories[traj_id]
             
             # Initialize for sequential processing
-            prev_distance = None
             traj_predictions = []
             traj_targets = []
             timestamps = []
@@ -358,9 +352,12 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
             for step in range(len(indices)):
                 idx = indices[step]
                 
-                # Get data point
+                # Get data point - normalized
                 (basic_features, summary_features), target = dataset[idx]
                 timestamps.append(dataset.all_data[idx]['timestamp'])
+                
+                # Store original target for metrics (denormalized)
+                original_target = dataset.denormalize_distance(target.item())
                 
                 # Create mask for single item
                 mask = torch.ones(1, basic_features.shape[0], dtype=bool)
@@ -372,35 +369,29 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
                 target = target.unsqueeze(0).to(device)
                 
                 if with_prior:
-                    # Generate prior using state transition function
+                    # Generate prior using ground truth + noise (same as training)
                     prior = torch.zeros(1, 1).to(device)
-                    
-                    if prev_distance is not None:
-                        # Apply constant velocity model
-                        prior[0, 0] = prev_distance + (velocity * delta_t)
-                    else:
-                        # First step - initialize with noisy ground truth
-                        noise = torch.randn(1).to(device) * noise_scale * target.item()
-                        prior[0, 0] = target.item() + noise
-                        # Ensure prior is positive (if distance can't be negative)
-                        prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
+                    noise = torch.randn(1).to(device) * noise_scale
+                    prior[0, 0] = target.item() + noise
+                    prior[0, 0] = torch.clamp(prior[0, 0], min=-3.0, max=3.0)
+                    prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
                     
                     output = model((basic_features, mask, summary_features), prior)
                 else:
                     output = model((basic_features, mask, summary_features))
                 
-                # Compute loss
+                # Compute loss on normalized values
                 loss = criterion(output, target)
                 total_loss += loss.item()
                 
-                # Store results
-                all_predictions.append(output.cpu().numpy())
-                all_targets.append(target.cpu().numpy())
-                traj_predictions.append(output.item())
-                traj_targets.append(target.item())
+                # Denormalize for storing and display
+                prediction_denormalized = dataset.denormalize_distance(output.item())
                 
-                # Update for next iteration
-                prev_distance = output.item()
+                # Store results
+                all_predictions.append(prediction_denormalized)
+                all_targets.append(original_target)
+                traj_predictions.append(prediction_denormalized)
+                traj_targets.append(original_target)
             
             # Store trajectory data for visualization if this is one of the selected trajectories
             if traj_id in trajectories_to_visualize:
@@ -415,9 +406,9 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
         print("WARNING: No valid predictions were made during evaluation.")
         return 0, 0, 0, [], []
     
-    # Calculate metrics
-    all_predictions = np.array(all_predictions).squeeze()
-    all_targets = np.array(all_targets).squeeze()
+    # Calculate metrics using denormalized values
+    all_predictions = np.array(all_predictions)
+    all_targets = np.array(all_targets)
     
     mse = np.mean((all_predictions - all_targets) ** 2)
     rmse = np.sqrt(mse)
@@ -470,7 +461,6 @@ def evaluate_model(model, dataset, test_trajectories, with_prior=False, noise_sc
     
     return mse, rmse, mae, all_predictions, all_targets
 
-
 def plot_trajectory_comparison(dataset, test_trajectories, basic_encoder, encoder_with_prior, noise_scale=0.05):
     """
     Plot comparison of ground truth vs basic encoder vs encoder with prior for specific trajectories
@@ -489,10 +479,6 @@ def plot_trajectory_comparison(dataset, test_trajectories, basic_encoder, encode
     test_traj_ids = list(test_trajectories.keys())
     trajectories_to_visualize = test_traj_ids[:3] if len(test_traj_ids) >= 3 else test_traj_ids
     
-    # Constants for state transition
-    delta_t = 1.0
-    velocity = 1.0
-    
     for traj_id in trajectories_to_visualize:
         indices = test_trajectories[traj_id]
         
@@ -502,17 +488,16 @@ def plot_trajectory_comparison(dataset, test_trajectories, basic_encoder, encode
         basic_predictions = []
         prior_predictions = []
         
-        # Initialize state tracking for encoder with prior
-        prev_distance_with_prior = None
-        
         with torch.no_grad():
             for step in range(len(indices)):
                 idx = indices[step]
                 
-                # Get data point
+                # Get data point - normalized
                 (basic_features, summary_features), target = dataset[idx]
                 timestamps.append(dataset.all_data[idx]['timestamp'])
-                ground_truth.append(target.item())
+                
+                # Store original target for plotting
+                ground_truth.append(dataset.denormalize_distance(target.item()))
                 
                 # Create mask and prepare inputs
                 mask = torch.ones(1, basic_features.shape[0], dtype=bool)
@@ -523,24 +508,18 @@ def plot_trajectory_comparison(dataset, test_trajectories, basic_encoder, encode
                 
                 # Basic encoder prediction
                 basic_output = basic_encoder((basic_features, mask, summary_features))
-                basic_predictions.append(basic_output.item())
+                # Denormalize for display
+                basic_predictions.append(dataset.denormalize_distance(basic_output.item()))
                 
-                # Encoder with prior prediction
+                # Encoder with prior prediction (using ground truth + noise)
                 prior = torch.zeros(1, 1).to(device)
-                if prev_distance_with_prior is not None:
-                    # Apply constant velocity model
-                    prior[0, 0] = prev_distance_with_prior + (velocity * delta_t)
-                else:
-                    # First step initialization
-                    noise = torch.randn(1).to(device) * noise_scale * target.item()
-                    prior[0, 0] = target.item() + noise
-                    prior[0, 0] = torch.max(prior[0, 0], torch.tensor(0.1).to(device))
+                noise = torch.randn(1).to(device) * noise_scale
+                prior[0, 0] = target.item() + noise
+                prior[0, 0] = torch.clamp(prior[0, 0], min=-3.0, max=3.0)
                 
                 prior_output = encoder_with_prior((basic_features, mask, summary_features), prior)
-                prior_predictions.append(prior_output.item())
-                
-                # Update prior for next iteration
-                prev_distance_with_prior = prior_output.item()
+                # Denormalize for display
+                prior_predictions.append(dataset.denormalize_distance(prior_output.item()))
         
         # Convert timestamps to relative time
         relative_time = np.array(timestamps) - timestamps[0]
@@ -573,6 +552,10 @@ def main():
     # Load data
     data_dir = 'data'  # Update this to your data directory
     dataset = UnderwaterDataset(data_dir)
+    
+    # Save normalization parameters for future use
+    os.makedirs('saved_models', exist_ok=True)
+    dataset.save_normalization_params('saved_models/normalization_params.npy')
     
     # Group data by trajectory ID
     trajectories = {}
@@ -639,7 +622,7 @@ def main():
     print("Training basic encoder...")
     basic_encoder = UnderwaterEncoder()
     trained_basic_encoder, train_losses_basic, val_losses_basic = train_encoder(
-        basic_encoder, train_loader, val_loader, num_epochs=20
+        basic_encoder, train_loader, val_loader, num_epochs=20, weight_decay=0.0001
     )
     
     # Train encoder with prior (using ground truth + noise approach)
@@ -651,7 +634,7 @@ def main():
     
     trained_encoder_with_prior, train_losses_prior, val_losses_prior = train_encoder_with_prior(
         encoder_with_prior, dataset, train_trajectories, val_trajectories, 
-        num_epochs=20, noise_scale=noise_scale
+        num_epochs=60, noise_scale=noise_scale, weight_decay=0.0001
     )
     
     # Evaluate models
