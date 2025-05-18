@@ -43,7 +43,7 @@ def custom_collate(batch):
     
     return (padded_features, mask, summary_features), targets
 
-def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=0.001):
+def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=0.003):
     """Train the basic encoder model"""
     model = model.to(device)
     
@@ -124,7 +124,7 @@ def train_encoder(model, train_loader, val_loader, num_epochs=50, learning_rate=
     
     return model, train_losses, val_losses
 
-def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectories, num_epochs=50, learning_rate=0.001, batch_size=32, noise_scale=0.05):
+def train_encoder_with_prior(model, dataset, train_trajectories, val_trajectories, num_epochs=50, learning_rate=0.003, batch_size=32, noise_scale=0.05):
     """
     Train the encoder with prior using ground truth + noise as prior
     
