@@ -1,419 +1,281 @@
-# train_latent_kalman_net_debug.py
-import torch
-import torch.nn as nn
-import torch.optim as optim
+"""
+Latent-KalmanNet training for the underwater multipath-arrival dataset
+=====================================================================
+A   (optional) : warm-up encoder on normalised distances
+B               : train KalmanNet (encoder frozen, km units, grad-clip)
+C               : fine-tune encoder (KalmanNet frozen)
+
+Typical run
+-----------
+python train_latent_kalman_net.py --data_dir data
+"""
+
+import argparse, random
+from pathlib import Path
+from typing import Dict, List
 import numpy as np
+import torch, torch.nn as nn, torch.optim as optim
 import matplotlib.pyplot as plt
-import random
-import os
-from tqdm import tqdm
 
-from latent_kalman_net_underwater import LatentKalmanNetUnderwater
-from underwater_dataset import UnderwaterDataset
-from model_Underwater import m, n, m1x_0, m2x_0, delta_t
+from underwater_dataset     import UnderwaterDataset
+from encoder_underwater      import UnderwaterEncoderWithPrior
+from kalman_net_underwater   import KalmanNetUnderwater
+from model_Underwater        import f_function, H, m, n, m2x_0   # constant-velocity model
 
+# ───────────── hyper-parameters ─────────────
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RNG_SEED     = 42
+TRAIN_RATIO, VAL_RATIO = 0.7, 0.15
 
-def check_tensor(tensor, name):
-    """Helper function to check if a tensor contains NaN or Inf values"""
-    if tensor is None:
-        print(f"WARNING: {name} is None")
-        return False
-        
-    has_nan = torch.isnan(tensor).any().item()
-    has_inf = torch.isinf(tensor).any().item()
-    
-    if has_nan:
-        print(f"WARNING: {name} contains NaN values")
-    if has_inf:
-        print(f"WARNING: {name} contains Inf values")
-    
-    return not (has_nan or has_inf)
+ENC_EPOCHS, ENC_LR, ENC_SIGMA = 20, 3e-3, 0.1             # Phase-A
+KNET_EPOCHS, KNET_LR         = 30, 3e-4                   # Phase-B  (↓ LR)
+FT_EPOCHS                    = 10                         # Phase-C
+CLIP_NORM                    = 10.0                       # grad-clip
+HEARTBEAT                    = 50                         # print every N traj
 
+#random.seed(RNG_SEED); np.random.seed(RNG_SEED); torch.manual_seed(RNG_SEED)
 
-def check_model_params(model, prefix=""):
-    """Check if model parameters contain NaN values"""
-    has_problems = False
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            full_name = f"{prefix}.{name}" if prefix else name
-            if not check_tensor(param.data, full_name):
-                has_problems = True
-            if param.grad is not None and not check_tensor(param.grad, f"{full_name}.grad"):
-                has_problems = True
-    return not has_problems
+# ─────────── misc helpers ───────────
+def build_traj_map(ds: UnderwaterDataset) -> Dict[int, List[int]]:
+    mp: Dict[int, List[int]] = {}
+    for i, d in enumerate(ds.all_data):
+        mp.setdefault(d["trajectory_id"], []).append(i)
+    for tid in mp: mp[tid].sort(key=lambda j: ds.all_data[j]["timestamp"])
+    return mp
 
+def make_noisy(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    return x + sigma * torch.randn_like(x) if sigma > 0 else x
 
-def train_kalman_net():
-    print("Training Latent-KalmanNet for underwater tracking...")
-    
-    # Create save directory
-    save_dir = "saved_models"
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Load dataset
-    dataset = UnderwaterDataset('data')
-    
-    # Group data by trajectory
-    trajectories = {}
-    for i, data_point in enumerate(dataset.all_data):
-        traj_id = data_point['trajectory_id']
-        if traj_id not in trajectories:
-            trajectories[traj_id] = []
-        trajectories[traj_id].append(i)
-    
-    # Sort indices within each trajectory by timestamp
-    for traj_id in trajectories:
-        trajectories[traj_id].sort(key=lambda idx: dataset.all_data[idx]['timestamp'])
-    
-    # Split into train/val/test
-    all_traj_ids = list(trajectories.keys())
-    random.seed(42)  # For reproducibility
-    random.shuffle(all_traj_ids)
-    
-    n_train = int(0.7 * len(all_traj_ids))
-    n_val = int(0.15 * len(all_traj_ids))
-    
-    train_traj_ids = all_traj_ids[:n_train]
-    val_traj_ids = all_traj_ids[n_train:n_train+n_val]
-    test_traj_ids = all_traj_ids[n_train+n_val:]
-    
-    train_trajectories = {traj_id: trajectories[traj_id] for traj_id in train_traj_ids}
-    val_trajectories = {traj_id: trajectories[traj_id] for traj_id in val_traj_ids}
-    test_trajectories = {traj_id: trajectories[traj_id] for traj_id in test_traj_ids}
-    
-    print(f"Training on {len(train_trajectories)} trajectories")
-    print(f"Validating on {len(val_trajectories)} trajectories")
-    print(f"Testing on {len(test_trajectories)} trajectories")
-    
-    # Create and build model
-    model = LatentKalmanNetUnderwater()
-    model.Build()
-    model.to(device)
-    
-    # Set better initial state covariance
-    # For km scale, use smaller covariance values
-    better_m2x_0 = torch.tensor([[0.1, 0.0], [0.0, 0.01]]).to(device)  # 100m×100m -> 0.1km×0.1km
-    
-    # Training parameters
-    num_epochs = 30
-    learning_rate = 0.0001  # Smaller learning rate for stability
-    batch_size = 8  # Process this many trajectories before updating weights
-    best_val_loss = float('inf')
-    
-    # We only want to train the KalmanNet part, keeping encoder fixed
-    for param in model.encoder.parameters():
-        param.requires_grad = False
-    
-    optimizer = optim.Adam(model.kalman_net.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
-    
-    # Training history
-    train_losses = []
-    val_losses = []
-    
-    def process_trajectory(model, indices, get_loss=True, debug=False):
-        """Process a full trajectory and return outputs and optionally loss"""
-        # Get first observation to initialize state
-        first_idx = indices[0]
-        first_features, first_target = dataset[first_idx]
-        
-        # Initialize state with first observation - in meters
-        initial_state = torch.zeros(m, 1).to(device)
-        initial_state[0, 0] = first_target.item()  # Set distance in meters
-        initial_state[1, 0] = 0.0  # Set initial velocity to 0
-        
-        if debug:
-            print(f"Initial state (m): {initial_state.squeeze().numpy()}")
-            print(f"Initial state (km): {initial_state[0,0].item() * model.meters_to_km:.4f} km")
-        
-        # Initialize sequence
-        model.InitSequence(initial_state, better_m2x_0)
-        
-        # Arrays to store results
-        predictions = []
-        targets = []
-        
-        # Process the full trajectory at once
-        for i, idx in enumerate(indices):
-            # Skip first observation used for initialization
-            if i == 0:
-                continue
-                
-            features, target = dataset[idx]
-            target = target.to(device)
-            
-            if debug and i <= 5:
-                print(f"\nStep {i}:")
-                print(f"Target (m): {target.item():.4f}")
-                print(f"Target (km): {target.item() * model.meters_to_km:.6f}")
-            
-            # Forward pass
-            try:
-                state = model(features)
-                
-                if debug and i <= 5:
-                    print(f"Model output (m): {state[0, 0, 0].item():.4f}, velocity (m/s): {state[0, 1, 0].item():.4f}")
-                    print(f"Internal KalmanNet state (km): {model.kalman_net.m1x_posterior[0, 0, 0].item():.6f}")
-                    print(f"Kalman gain: {model.kalman_net.KGain[0, :, 0].detach().cpu().numpy()}")
-                
-                # Check for NaN values in output
-                if not check_tensor(state, f"Model output at step {i}"):
-                    if debug:
-                        print("Skipping this step due to NaN/Inf in output")
-                    continue
-                    
-                # Store results
-                predictions.append(state[0, 0, 0])
-                targets.append(target)
-                
-            except Exception as e:
-                print(f"Error during forward pass at step {i}: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
-                continue
-        
-        # Convert to tensors
-        if predictions:
-            predictions = torch.stack(predictions)
-            targets = torch.stack(targets)
-            
-            # Make sure dimensions match
-            if predictions.dim() != targets.dim():
-                predictions = predictions.view(predictions.shape[0], 1)
-                
-            # Check tensors
-            valid_preds = check_tensor(predictions, "Predictions tensor")
-            valid_targets = check_tensor(targets, "Targets tensor")
-            
-            # Calculate loss if requested
-            if get_loss and len(predictions) > 0 and valid_preds and valid_targets:
-                try:
-                    loss = criterion(predictions, targets)
-                    
-                    if debug:
-                        print(f"Loss value: {loss.item():.6f}")
-                    
-                    if not check_tensor(loss, "Loss"):
-                        return None, predictions.detach().cpu().numpy(), targets.detach().cpu().numpy()
-                        
-                    return loss, predictions.detach().cpu().numpy(), targets.detach().cpu().numpy()
-                except Exception as e:
-                    print(f"Error calculating loss: {e}")
-                    return None, predictions.detach().cpu().numpy(), targets.detach().cpu().numpy()
-                
-        return None, [], []
-    
-    # Training loop
-    for epoch in range(num_epochs):
-        model.train()
-        
-        # Initial model parameter check
-        if epoch == 0:
-            print("Checking initial model parameters...")
-            check_model_params(model.kalman_net, "KalmanNet")
-        
-        # Shuffle training trajectories
-        train_traj_list = list(train_trajectories.keys())
-        random.shuffle(train_traj_list)
-        
-        # Process trajectories in batches
-        batch_losses = []
-        
-        # Process in batches
-        for i in range(0, len(train_traj_list), batch_size):
-            batch_traj_ids = train_traj_list[i:i+batch_size]
-            
-            # Zero gradients at batch start
-            optimizer.zero_grad()
-            
-            # Process each trajectory in batch
-            batch_loss = 0
-            valid_trajectories = 0
-            
-            # Debug first batch in first epoch
-            debug_this_batch = (epoch == 0 and i == 0)
-            
-            for traj_id in batch_traj_ids:
-                indices = train_trajectories[traj_id]
-                
-                # Skip very short trajectories
-                if len(indices) < 5:
-                    continue
-                    
-                # Process trajectory with debug for first trajectory in first batch of first epoch
-                debug_this_traj = debug_this_batch and (traj_id == batch_traj_ids[0])
-                loss, _, _ = process_trajectory(model, indices, debug=debug_this_traj)
-                
-                if loss is not None:
-                    # Print loss value for debugging
-                    if debug_this_traj:
-                        print(f"Trajectory {traj_id} loss: {loss.item():.6f}")
-                    
-                    batch_loss += loss
-                    valid_trajectories += 1
-            
-            # Update only if we have valid trajectories
-            if valid_trajectories > 0:
-                # Average the loss
-                batch_loss = batch_loss / valid_trajectories
-                
-                # Check loss before backward
-                if not check_tensor(batch_loss, "Batch loss before backward"):
-                    print(f"Skipping batch update due to invalid loss")
-                    continue
-                
-                # Backward pass on batch loss
-                batch_loss.backward()
-                
-                # Check for NaN in gradients
-                if not check_model_params(model.kalman_net, "KalmanNet"):
-                    print("NaN detected in gradients or parameters! Skipping this batch update.")
-                    optimizer.zero_grad()  # Clear the bad gradients
-                    continue  # Skip this batch update
-                
-                # Add gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.kalman_net.parameters(), max_norm=1.0)
-                
-                # Update model
-                optimizer.step()
-                
-                # Store batch loss
-                batch_losses.append(batch_loss.item())
-                
-            # Print progress
-            if (i // batch_size) % 5 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {i//batch_size + 1}/{len(train_traj_list)//batch_size + 1}")
-                if batch_losses:
-                    print(f"Current average batch loss: {sum(batch_losses)/len(batch_losses):.6f}")
-        
-        # Average training loss for epoch
-        if batch_losses:
-            epoch_train_loss = sum(batch_losses) / len(batch_losses)
-            train_losses.append(epoch_train_loss)
-        else:
-            epoch_train_loss = float('inf')
-            train_losses.append(epoch_train_loss)
-        
-        # Validation
-        model.eval()
-        val_losses_epoch = []
-        
-        with torch.no_grad():
-            for traj_id in val_traj_ids:
-                indices = val_trajectories[traj_id]
-                
-                # Skip short trajectories
-                if len(indices) < 5:
-                    continue
-                
-                # Process trajectory
-                loss, _, _ = process_trajectory(model, indices)
-                
-                if loss is not None:
-                    val_losses_epoch.append(loss.item())
-        
-        # Average validation loss
-        if val_losses_epoch:
-            epoch_val_loss = sum(val_losses_epoch) / len(val_losses_epoch)
-            val_losses.append(epoch_val_loss)
-        else:
-            epoch_val_loss = float('inf')
-            val_losses.append(epoch_val_loss)
-        
-        # Print epoch summary
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {epoch_train_loss:.6f}, Val Loss: {epoch_val_loss:.6f}")
-        
-        # Check model parameters periodically
-        if epoch % 5 == 0 or epoch == num_epochs-1:
-            print("Checking model parameters...")
-            check_model_params(model.kalman_net, "KalmanNet")
-        
-        # Save best model
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            torch.save(model.state_dict(), f"{save_dir}/best_latent_kalman_net.pth")
-            print(f"Saved new best model with val_loss: {epoch_val_loss:.6f}")
-    
-    # Plot training curves
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{save_dir}/training_curve.png")
-    plt.close()
-    
-    print(f"Training complete. Best validation loss: {best_val_loss:.6f}")
-    
-    # Test on the best model
-    model.load_state_dict(torch.load(f"{save_dir}/best_latent_kalman_net.pth"))
-    model.eval()
-    
-    # Process a few test trajectories for visualization
+# ─────────── unit converters (km ⇆ z-score) ───────────
+KM   = 1e3  # 1 km = 1000 m   – KalmanNet works in kilometres
+to_raw  = lambda norm, ds: (norm * ds.distance_std + ds.distance_mean) / KM          # → km
+to_norm = lambda km,   ds: ((km * KM) - ds.distance_mean) / ds.distance_std          # → z-score
+
+# ─────────── Phase-A : encoder warm-up (normalised) ───────────
+def train_encoder(enc, ds, tr, val, save):
+    mse = nn.MSELoss(); opt = optim.AdamW(enc.parameters(), lr=ENC_LR, weight_decay=1e-2)
+    best = float("inf"); tm = build_traj_map(ds)
+    for ep in range(1, ENC_EPOCHS+1):
+        print(f"\n[ENC] epoch {ep}/{ENC_EPOCHS} – {len(tr)} trajectories")
+        enc.train(); random.shuffle(tr); run = seen = 0
+        for tid in tr:
+            opt.zero_grad(); loss_t = 0.0
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                prior_n = make_noisy(tgt_n, ENC_SIGMA).unsqueeze(1).to(DEVICE)
+                out = enc((basic.unsqueeze(0).to(DEVICE),
+                           torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                           summary.unsqueeze(0).to(DEVICE)), prior_n)
+                loss_t += mse(out, tgt_n.to(DEVICE).view_as(out))
+            (loss_t/len(tm[tid])).backward(); opt.step()
+            run += loss_t.item(); seen += 1
+            if seen % HEARTBEAT == 0:
+                print(f"    …{seen}/{len(tr)} traj, running loss {run/seen:.3e}")
+        val_mse = evaluate_encoder(enc, ds, val);              # below
+        if val_mse < best:
+            best = val_mse; torch.save(enc.state_dict(), save/"best_encoder_seq.pth")
+        print(f"[ENC] epoch {ep} done | val {val_mse:.3e}{' *' if val_mse==best else ''}")
+
+def evaluate_encoder(enc, ds, tids):
+    mse = nn.MSELoss(); tm = build_traj_map(ds); tot = cnt = 0
+    enc.eval()
     with torch.no_grad():
-        for i, traj_id in enumerate(test_traj_ids[:5]):
-            indices = test_trajectories[traj_id]
-            
-            # Skip short trajectories
-            if len(indices) < 5:
-                continue
-            
-            # Process trajectory
-            loss, predictions, targets = process_trajectory(model, indices)
-            
-            # Plot results if we have data
-            if len(predictions) > 0:
-                plt.figure(figsize=(10, 6))
-                plt.plot(targets, 'k-', label='Ground Truth')
-                plt.plot(predictions, 'b-', label='Latent-KalmanNet')
-                plt.xlabel('Time Step')
-                plt.ylabel('Distance (m)')
-                plt.title(f'Test Trajectory {traj_id}')
-                plt.legend()
-                plt.grid(True)
-                plt.savefig(f"{save_dir}/test_trajectory_{traj_id}.png")
-                plt.close()
-                
-                # Print stats for this trajectory
-                if loss is not None:
-                    mse = loss.item()
-                    rmse = np.sqrt(mse)
-                    print(f"Trajectory {traj_id} - MSE: {mse:.6f}, RMSE: {rmse:.6f}")
-    
-    # Calculate overall test performance
-    test_losses = []
+        for tid in tids:
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                out = enc((basic.unsqueeze(0).to(DEVICE),
+                           torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                           summary.unsqueeze(0).to(DEVICE)), tgt_n.unsqueeze(1).to(DEVICE))
+                tot += mse(out, tgt_n.to(DEVICE).view_as(out)).item(); cnt += 1
+    return tot/cnt
+
+# ─────────── Phase-B : KalmanNet training (km) ───────────
+def train_knet(knet, enc, ds, tr, val, save):
+    for p in enc.parameters(): p.requires_grad_(False)
+    mse = nn.MSELoss(); opt = optim.Adam(knet.parameters(), lr=KNET_LR)
+    best = float("inf"); tm = build_traj_map(ds)
+    for ep in range(1, KNET_EPOCHS+1):
+        print(f"\n[KNET] epoch {ep}/{KNET_EPOCHS} – {len(tr)} trajectories")
+        knet.train(); random.shuffle(tr); run = seen = 0; tr_sum = tr_cnt = 0
+        for tid in tr:
+            opt.zero_grad(); loss_t = 0.0
+            first = tm[tid][0]
+            (b0,s0),t0_n = ds[first]
+            z0_km = to_raw(enc((b0.unsqueeze(0).to(DEVICE),
+                                torch.ones(1,b0.size(0),dtype=torch.bool,device=DEVICE),
+                                s0.unsqueeze(0).to(DEVICE)), t0_n.unsqueeze(1).to(DEVICE)).squeeze(0), ds)
+            knet.InitSequence(torch.tensor([[z0_km.item()],[0.0]], device=DEVICE), m2x_0.to(DEVICE))
+            prev_pred_km = knet.m1x_posterior[:,0:1,0]  # km
+
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                prior_n = to_norm(prev_pred_km, ds)
+                z_km = to_raw(enc((basic.unsqueeze(0).to(DEVICE),
+                                   torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                                   summary.unsqueeze(0).to(DEVICE)), prior_n).squeeze(0), ds)
+                est = knet(z_km); pred_km = est[:,0,0]
+                loss = mse(pred_km, to_raw(tgt_n, ds))
+                loss_t += loss; tr_sum += loss.item(); tr_cnt += 1
+                prev_pred_km = knet.m1x_prior[:,0:1,0]
+            (loss_t/len(tm[tid])).backward()
+            torch.nn.utils.clip_grad_norm_(knet.parameters(), CLIP_NORM)  # <-- stabiliser
+            opt.step()
+            run += loss_t.item(); seen += 1
+            if seen % HEARTBEAT == 0:
+                print(f"    …{seen}/{len(tr)} traj, running loss {run/seen:.3e}")
+        val_mse = evaluate_knet(knet, enc, ds, val)
+        if val_mse < best:
+            best = val_mse; torch.save(knet.state_dict(), save/"knet_best.pth")
+        print(f"[KNET] epoch {ep} done | train {tr_sum/tr_cnt:.3e} | val {val_mse:.3e}{' *' if val_mse==best else ''}")
+
+def evaluate_knet(knet, enc, ds, tids):
+    mse = nn.MSELoss(); tm = build_traj_map(ds); tot = cnt = 0
+    knet.eval(); enc.eval()
     with torch.no_grad():
-        for traj_id in test_traj_ids:
-            indices = test_trajectories[traj_id]
-            
-            # Skip short trajectories
-            if len(indices) < 5:
-                continue
-            
-            # Process trajectory
-            loss, _, _ = process_trajectory(model, indices)
-            
-            if loss is not None:
-                test_losses.append(loss.item())
-    
-    # Average test loss
-    if test_losses:
-        avg_test_loss = sum(test_losses) / len(test_losses)
-        test_rmse = np.sqrt(avg_test_loss)
-        print(f"Test Loss: {avg_test_loss:.6f}, RMSE: {test_rmse:.6f}")
+        for tid in tids:
+            first = tm[tid][0]
+            (b0,s0),t0_n = ds[first]
+            z0_km = to_raw(enc((b0.unsqueeze(0).to(DEVICE),
+                                torch.ones(1,b0.size(0),dtype=torch.bool,device=DEVICE),
+                                s0.unsqueeze(0).to(DEVICE)), t0_n.unsqueeze(1).to(DEVICE)).squeeze(0), ds)
+            knet.InitSequence(torch.tensor([[z0_km.item()],[0.0]], device=DEVICE), m2x_0.to(DEVICE))
+            prev_pred_km = knet.m1x_posterior[:,0:1,0]
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                z_km = to_raw(enc((basic.unsqueeze(0).to(DEVICE),
+                                   torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                                   summary.unsqueeze(0).to(DEVICE)),
+                                  to_norm(prev_pred_km, ds)).squeeze(0), ds)
+                est = knet(z_km); prev_pred_km = knet.m1x_prior[:,0:1,0]
+                tot += mse(est[:,0,0], to_raw(tgt_n, ds)).item(); cnt += 1
+    return tot/cnt
+
+# ─────────── Phase-C : encoder fine-tune (mixed) ───────────
+def finetune_encoder(enc, knet, ds, tr, val, save):
+    for p in knet.parameters(): p.requires_grad_(False)
+    for p in enc.parameters():  p.requires_grad_(True)
+    opt = optim.Adam(enc.parameters(), lr=1e-4); mse = nn.MSELoss(); best=float("inf")
+    tm = build_traj_map(ds)
+    for ep in range(1, FT_EPOCHS+1):
+        print(f"\n[FT]  epoch {ep}/{FT_EPOCHS} – {len(tr)} trajectories")
+        enc.train(); random.shuffle(tr); run = seen = 0
+        for tid in tr:
+            opt.zero_grad(); loss_t = 0.0
+            first = tm[tid][0]
+            (b0,s0),t0_n = ds[first]
+            z0_km = to_raw(enc((b0.unsqueeze(0).to(DEVICE),
+                                torch.ones(1,b0.size(0),dtype=torch.bool,device=DEVICE),
+                                s0.unsqueeze(0).to(DEVICE)), t0_n.unsqueeze(1).to(DEVICE)).squeeze(0), ds)
+            knet.InitSequence(torch.tensor([[z0_km.item()],[0.0]], device=DEVICE), m2x_0.to(DEVICE))
+            prev_pred_km = knet.m1x_posterior[:,0:1,0]
+
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                z_km = to_raw(enc((basic.unsqueeze(0).to(DEVICE),
+                                   torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                                   summary.unsqueeze(0).to(DEVICE)),
+                                  to_norm(prev_pred_km, ds)).squeeze(0), ds)
+                est = knet(z_km); prev_pred_km = knet.m1x_prior[:,0:1,0]
+                loss_t += mse(est[:,0,0], to_raw(tgt_n, ds))
+            (loss_t/len(tm[tid])).backward()
+            torch.nn.utils.clip_grad_norm_(enc.parameters(), CLIP_NORM)
+            opt.step()
+            run += loss_t.item(); seen += 1
+            if seen % HEARTBEAT == 0:
+                print(f"    …{seen}/{len(tr)} traj, running loss {run/seen:.3e}")
+        val_mse = evaluate_knet(knet, enc, ds, val)
+        if val_mse < best:
+            best = val_mse; torch.save(enc.state_dict(), save/"enc_finetuned.pth")
+        print(f"[FT]  epoch {ep} done | val {val_mse:.3e}{' *' if val_mse==best else ''}")
+
+
+def plot_some_trajectories(knet, enc, ds, tids, num=3):
+    tm = build_traj_map(ds); knet.eval(); enc.eval()
+    with torch.no_grad():
+        for tid in tids[:num]:
+            idx0 = tm[tid][0]
+            (b0,s0),t0_n = ds[idx0]
+            z0_km = to_raw(enc((b0.unsqueeze(0).to(DEVICE),
+                                torch.ones(1,b0.size(0),dtype=torch.bool,device=DEVICE),
+                                s0.unsqueeze(0).to(DEVICE)), t0_n.unsqueeze(1).to(DEVICE)).squeeze(0), ds)
+            knet.InitSequence(torch.tensor([[z0_km.item()],[0.0]], device=DEVICE), m2x_0.to(DEVICE))
+            pred, gt = [], []
+            prev_pred_km = knet.m1x_posterior[:,0:1,0]
+            for idx in tm[tid]:
+                (basic, summary), tgt_n = ds[idx]
+                z_km = to_raw(enc((basic.unsqueeze(0).to(DEVICE),
+                                   torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                                   summary.unsqueeze(0).to(DEVICE)),
+                                  to_norm(prev_pred_km, ds)).squeeze(0), ds)
+                est = knet(z_km); prev_pred_km = knet.m1x_prior[:,0:1,0]
+                pred.append(est[:,0,0].item()*KM)              # km → m
+                gt.append(to_raw(tgt_n, ds).item()*KM)
+            plt.figure()
+            plt.plot(gt, label='GT'); plt.plot(pred, label='KNet')
+            plt.xlabel('timestep'); plt.ylabel('distance [m]')
+            plt.title(f'Trajectory {tid}'); plt.legend(); plt.tight_layout()
+            plt.savefig(Path('plots')/f'traj_{tid}.png')
+
+# ─────────── main ───────────
+def main():
+    pa = argparse.ArgumentParser()
+    pa.add_argument("--data_dir", default="data"); pa.add_argument("--encoder_ckpt")
+    pa.add_argument("--force_pretrain", action="store_true"); pa.add_argument("--save_dir", default="saved_models")
+    args = pa.parse_args(); save = Path(args.save_dir); save.mkdir(exist_ok=True)
+    print(f"[setup] device={DEVICE}")
+
+    # dataset ---------------------------------------------------------------
+    ds = UnderwaterDataset(args.data_dir)
+    tids = list({d["trajectory_id"] for d in ds.all_data}); random.shuffle(tids)
+    n_tr, n_val = int(TRAIN_RATIO*len(tids)), int(VAL_RATIO*len(tids))
+    tr_tids, val_tids, te_tids = tids[:n_tr], tids[n_tr:n_tr+n_val], tids[n_tr+n_val:]
+    ds.compute_normalisation_stats(indices=[i for tid in tr_tids for i in build_traj_map(ds)[tid]])
+
+    stats_file = save / "norm_stats.npz"
+    np.savez(stats_file,
+            dist_mean=ds.distance_mean,
+            dist_std =ds.distance_std,
+            amp_mean =ds.amplitude_mean,
+            amp_std  =ds.amplitude_std,
+            dly_mean =ds.delay_mean,
+            dly_std  =ds.delay_std,
+            summ_mean=ds.summary_means,
+            summ_std =ds.summary_stds)
+    print(f"[norm] statistics saved to {stats_file}")
+
+    # models ---------------------------------------------------------------
+    enc  = UnderwaterEncoderWithPrior().to(DEVICE)
+    knet = KalmanNetUnderwater().to(DEVICE); knet.Build(m=m, n=n, f_function=f_function,
+                                                       H=H.to(DEVICE))
+
+    # warm-start encoder ----------------------------------------------------
+    ckpt = Path(args.encoder_ckpt) if args.encoder_ckpt else Path("saved_models")/"best_encoder_seq.pth"
+    if ckpt.exists():
+        enc.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+        print(f"[init] loaded {ckpt}")
+        pretrained = True
     else:
-        print("No valid test trajectories!")
-    
-    print("Training and evaluation complete!")
+        pretrained = False
 
+    if not pretrained or args.force_pretrain:
+        print("\n==== Phase-A : encoder warm-up ====")
+        train_encoder(enc, ds, tr_tids, val_tids, save)
+        enc.load_state_dict(torch.load(save/"best_encoder_seq.pth", map_location=DEVICE))
+    else:
+        print("\n[skip] Phase-A")
+
+    print("\n==== Phase-B : KalmanNet training ====")
+    train_knet(knet, enc, ds, tr_tids, val_tids, save)
+    knet.load_state_dict(torch.load(save/"knet_best.pth", map_location=DEVICE))
+
+    print("\n==== Phase-C : encoder fine-tune ====")
+    finetune_encoder(enc, knet, ds, tr_tids, val_tids, save)
+
+    # test -----------------------------------------------------------------
+    test_mse = evaluate_knet(knet, enc, ds, te_tids)
+    rmse_m   = np.sqrt(test_mse) * KM   # convert km → m for final metric
+    print(f"\n[test] RMSE = {rmse_m:.2f} m")
+    plot_some_trajectories(knet, enc, ds, te_tids)
 
 if __name__ == "__main__":
-    train_kalman_net()
+    main()

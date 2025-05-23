@@ -1,154 +1,70 @@
 import torch
 import torch.nn as nn
 
+# small helper MLP ---------------------------------------------------------
+class _MLP(nn.Sequential):
+    def __init__(self, inp: int, hid: int):
+        super().__init__(
+            nn.Linear(inp, hid), nn.ReLU(), nn.LayerNorm(hid),
+            nn.Linear(hid, hid), nn.ReLU(), nn.LayerNorm(hid)
+        )
+
+# --------------------------------------------------------------------------
 class UnderwaterEncoder(nn.Module):
+    """Baseline encoder *without* explicit prior."""
     def __init__(self):
-        super(UnderwaterEncoder, self).__init__()
-        
-        # Process amplitude and delay pairs with a small MLP
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(2, 32),
-            nn.ReLU(),
-            nn.LayerNorm(32),  # Add batch normalization
-            nn.Dropout(0.2),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.LayerNorm(64),  # Add batch normalization
-            nn.Dropout(0.2)
-        )
-        
-        # Process channel summary features
-        self.summary_processor = nn.Sequential(
-            nn.Linear(5, 16),  # Updated for 5 features
-            nn.ReLU(),
-            nn.LayerNorm(16),  # Add batch normalization
-            nn.Dropout(0.2)
-        )
-        
-        # Final regression layer
+        super().__init__()
+        self.feature_extractor = _MLP(2, 64)
+        self.summary_processor = _MLP(5, 16)
         self.regressor = nn.Sequential(
-            nn.Linear(64 + 16, 32),
-            nn.ReLU(),
-            nn.LayerNorm(32),  # Add batch normalization
-            nn.Dropout(0.2),
-            nn.Linear(32, 1)  # Output distance estimate
+            nn.Linear(64 + 16, 32), nn.ReLU(), nn.LayerNorm(32), nn.Linear(32, 1)
         )
 
     def forward(self, x):
-        if isinstance(x, tuple) and len(x) == 3:
-            # Unpack with mask
-            basic_features, mask, summary_features = x
+        if len(x) == 3:
+            basic, mask, summary = x
         else:
-            # For backward compatibility
-            basic_features, summary_features = x
-            mask = torch.ones(basic_features.shape[0], basic_features.shape[1], dtype=bool).to(basic_features.device)
-        
-        # Process amplitude-delay pairs
-        batch_size, max_arrivals, _ = basic_features.shape
-        reshaped = basic_features.reshape(-1, 2)
-        processed = self.feature_extractor(reshaped)
-        processed = processed.reshape(batch_size, max_arrivals, -1)
-        
-        # Apply mask to zero out padding
-        mask = mask.unsqueeze(2).expand(-1, -1, processed.shape[2])
-        processed = processed * mask.float()
-        
-        # Global pooling across arrivals dimension (only counting non-padded elements)
-        processed = processed.transpose(1, 2)  # Shape: batch x features x arrivals
-        
-        # Sum and divide by count of non-padded elements (per batch item)
-        arrivals_count = mask[:, :, 0].sum(dim=1).unsqueeze(1)  # Count of arrivals per batch
-        pooled = processed.sum(dim=2) / (arrivals_count + 1e-10)  # Shape: batch x features
-        
-        # Process summary features
-        summary = self.summary_processor(summary_features)
-        
-        # Combine features
-        combined = torch.cat([pooled, summary], dim=1)
-        
-        # Final regression
-        distance = self.regressor(combined)
-        
-        return distance
+            basic, summary = x
+            mask = torch.ones(basic.size(0), basic.size(1), dtype=torch.bool, device=basic.device)
 
+        B, A, _ = basic.shape
+        proc = self.feature_extractor(basic.view(-1, 2)).view(B, A, 64)
+        proc = proc * mask.unsqueeze(2).float()
+        pooled = proc.sum(1) / mask.sum(1).clamp(min=1).unsqueeze(1)
+        return self.regressor(torch.cat([pooled, self.summary_processor(summary)], 1))
 
+# --------------------------------------------------------------------------
 class UnderwaterEncoderWithPrior(nn.Module):
+    """Encoder that consumes a *scalar* prior (e.g. previous‑step distance).
+
+    Uses a residual connection:  output = prior + f(features).
+    This makes the identity mapping (copy‑prior) trivial when noise=0 and
+    allows the network to learn small corrections when noise>0.
+    """
     def __init__(self):
-        super(UnderwaterEncoderWithPrior, self).__init__()
-        
-        # Process amplitude and delay pairs with a small MLP
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(2, 32),
-            nn.ReLU(),
-            nn.LayerNorm(32),
-            nn.Dropout(0.2),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.LayerNorm(64),
-            nn.Dropout(0.2)
-        )
-        
-        # Process channel summary features
-        self.summary_processor = nn.Sequential(
-            nn.Linear(5, 16),  # Updated for 5 features
-            nn.ReLU(),
-            nn.LayerNorm(16),
-            nn.Dropout(0.2)
-        )
-        
-        # Process prior state information
-        self.prior_processor = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-            nn.LayerNorm(16),
-            nn.Dropout(0.2)
-        )
-        
-        # Final regression layer
+        super().__init__()
+        self.feature_extractor = _MLP(2, 64)
+        self.summary_processor = _MLP(5, 16)
+        self.prior_processor = _MLP(1, 16)
         self.regressor = nn.Sequential(
-            nn.Linear(64 + 16 + 16, 32),
-            nn.ReLU(),
-            nn.LayerNorm(32),
-            nn.Dropout(0.2),
-            nn.Linear(32, 1)
+            nn.Linear(64 + 16 + 16, 32), nn.ReLU(), nn.LayerNorm(32), nn.Linear(32, 1)
         )
-    
+
     def forward(self, x, prior):
-        if isinstance(x, tuple) and len(x) == 3:
-            # Unpack with mask
-            basic_features, mask, summary_features = x
+        if len(x) == 3:
+            basic, mask, summary = x
         else:
-            # For backward compatibility
-            basic_features, summary_features = x
-            mask = torch.ones(basic_features.shape[0], basic_features.shape[1], dtype=bool).to(basic_features.device)
-        
-        # Process amplitude-delay pairs
-        batch_size, max_arrivals, _ = basic_features.shape
-        reshaped = basic_features.reshape(-1, 2)
-        processed = self.feature_extractor(reshaped)
-        processed = processed.reshape(batch_size, max_arrivals, -1)
-        
-        # Apply mask to zero out padding
-        mask = mask.unsqueeze(2).expand(-1, -1, processed.shape[2])
-        processed = processed * mask.float()
-        
-        # Global pooling across arrivals dimension (only counting non-padded elements)
-        processed = processed.transpose(1, 2)  # Shape: batch x features x arrivals
-        
-        # Sum and divide by count of non-padded elements (per batch item)
-        arrivals_count = mask[:, :, 0].sum(dim=1).unsqueeze(1)  # Count of arrivals per batch
-        pooled = processed.sum(dim=2) / (arrivals_count + 1e-10)  # Shape: batch x features
-        
-        # Process summary features
-        summary = self.summary_processor(summary_features)
-        
-        # Process prior state (just distance)
-        prior_features = self.prior_processor(prior)
-        
-        # Combine all features
-        combined = torch.cat([pooled, summary, prior_features], dim=1)
-        
-        # Final regression
-        distance = self.regressor(combined)
-        
-        return distance
+            basic, summary = x
+            mask = torch.ones(basic.size(0), basic.size(1), dtype=torch.bool, device=basic.device)
+
+        B, A, _ = basic.shape
+        proc = self.feature_extractor(basic.view(-1, 2)).view(B, A, 64)
+        proc = proc * mask.unsqueeze(2).float()
+        pooled = proc.sum(1) / mask.sum(1).clamp(min=1).unsqueeze(1)
+        combined = torch.cat([
+            pooled,
+            self.summary_processor(summary),
+            self.prior_processor(prior)
+        ], 1)
+        delta = self.regressor(combined)
+        return prior + delta  # skip connection

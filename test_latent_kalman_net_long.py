@@ -1,224 +1,142 @@
-# test_long_trajectory.py
-import torch
-import pandas as pd
+#!/usr/bin/env python
+"""
+Evaluate one trajectory with the trained Latent-KalmanNet
+Filters rows to:  Transmitter_Name == 'Alice'   AND   Sensor_ID == 'Apex'
+"""
+
+import argparse, random, math
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from tqdm import tqdm
-import math
-from latent_kalman_net_underwater import LatentKalmanNetUnderwater
-from model_Underwater import m, n, m1x_0, m2x_0
+import torch
 
-def load_long_trajectory(file_path, transmitter_name="Alice"):
-    """
-    Load and preprocess the long trajectory data for a specific transmitter
-    """
-    print(f"Loading data for transmitter {transmitter_name} from {file_path}")
-    
-    # Read the CSV file
-    df = pd.read_csv(file_path)
-    
-    # Filter for the specified transmitter
-    df = df[df['Transmitter_Name'] == transmitter_name]
-    
-    # Get all timestamps in order
-    all_timestamps = df['Timestamp'].unique()
-    all_timestamps.sort()
-    
-    print(f"Found {len(all_timestamps)} unique timestamps for {transmitter_name}")
-    
-    # Create a list to store processed data for each timestamp
-    processed_data = []
-    ground_truth_distances = []
-    
-    # Process each timestamp
-    for timestamp in tqdm(all_timestamps, desc="Processing timestamps"):
-        # Get data for this timestamp
-        timestamp_data = df[df['Timestamp'] == timestamp]
-        
-        # Calculate ground truth distance using the Euclidean distance formula
-        # Convert to meters since our model works in meters
-        tx_x = timestamp_data['Transmitter_X(km)'].iloc[0] * 1000  # km to m
-        tx_y = timestamp_data['Transmitter_Y(km)'].iloc[0] * 1000  # km to m
-        rx_x = timestamp_data['Receiver_X(km)'].iloc[0] * 1000     # km to m
-        rx_y = timestamp_data['Receiver_Y(km)'].iloc[0] * 1000     # km to m
-        
-        distance = math.sqrt((tx_x - rx_x)**2 + (tx_y - rx_y)**2)
-        ground_truth_distances.append(distance)
-        
-        # Extract amplitude and delay pairs
-        amplitudes = timestamp_data['Amplitude'].values
-        delays = timestamp_data['Delay(s)'].values
-        
-        # Calculate channel features
-        num_taps = len(amplitudes)
-        avg_tap_power = np.mean(np.abs(amplitudes))
-        
-        # Calculate delay spread
-        min_delay = np.min(delays)
-        weights = np.abs(amplitudes) ** 2
-        weight_sum = np.sum(weights)
-        
-        # Avoid division by zero
-        if weight_sum > 0:
-            delay_spread = np.sqrt(np.sum(weights * (delays - min_delay) ** 2) / weight_sum)
-        else:
-            delay_spread = 0
-        
-        # Calculate average path delay
-        if np.sum(np.abs(amplitudes)) > 0:
-            avg_path_delay = np.sum(np.abs(amplitudes) * (delays - min_delay)) / np.sum(np.abs(amplitudes))
-        else:
-            avg_path_delay = 0
-            
-        # Store processed data
-        processed_data.append({
-            'amplitudes': amplitudes,
-            'delays': delays,
-            'distance': distance,
-            'timestamp': timestamp,
-            'num_taps': num_taps,
-            'avg_tap_power': avg_tap_power,
-            'delay_spread': delay_spread,
-            'avg_path_delay': avg_path_delay
-        })
-    
-    return processed_data, ground_truth_distances, all_timestamps
+from underwater_dataset    import UnderwaterDataset
+from encoder_underwater     import UnderwaterEncoderWithPrior
+from kalman_net_underwater  import KalmanNetUnderwater
+from model_Underwater       import f_function, H, m, n, m2x_0        # km model
 
-def prepare_model_input(timestep_data):
-    """Prepare model input from processed data point"""
-    # Create basic features: amplitude and delay pairs
-    amplitude_delay_pairs = np.vstack((
-        timestep_data['amplitudes'],
-        timestep_data['delays']
-    )).T
-    
-    # Create tensor from amplitude-delay pairs
-    basic_features = torch.FloatTensor(amplitude_delay_pairs)
-    
-    # Create summary features tensor
-    summary_features = torch.FloatTensor([
-        timestep_data['num_taps'],
-        timestep_data['avg_tap_power'],
-        timestep_data['delay_spread'],
-        timestep_data['avg_path_delay']
-    ])
-    
-    return basic_features, summary_features
+# ───────── constants ─────────
+DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+KM       = 1e3
+TRAIN_RATIO, VAL_RATIO, RNG_SEED = 0.7, 0.15, 42
+PLOT_DIR = Path("plots"); PLOT_DIR.mkdir(exist_ok=True)
 
-def test_long_trajectory():
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # Model setup
-    print("Loading fine-tuned model...")
-    model = LatentKalmanNetUnderwater()
-    model.Build(encoder_path="saved_models/best_encoder_with_prior.pth")
-    model.load_state_dict(torch.load("saved_models/best_fine_tuned_latent_kalman_net.pth", 
-                                     map_location=device))
-    model.to(device)
-    model.eval()
-    
-    # If fine-tuned model not found, try the regular trained model
-    if "AttributeError" in str(model):
-        print("Fine-tuned model not found, trying regular trained model...")
-        model = LatentKalmanNetUnderwater()
-        model.Build(encoder_path="saved_models/best_encoder_with_prior.pth")
-        model.load_state_dict(torch.load("saved_models/best_latent_kalman_net.pth", 
-                                         map_location=device))
-        model.to(device)
-        model.eval()
-    
-    # Load data
-    processed_data, ground_truth_distances, timestamps = load_long_trajectory(
-        "data/all_arrivals_long.csv", transmitter_name="Alice")
-    
-    # Better initial state covariance
-    better_m2x_0 = torch.tensor([[0.1, 0.0], [0.0, 0.01]]).to(device)
-    
-    # Initialize model with first observation
-    first_data = processed_data[0]
-    initial_state = torch.zeros(m, 1).to(device)
-    initial_state[0, 0] = first_data['distance']  # Set distance in meters
-    initial_state[1, 0] = 0.0  # Set initial velocity to 0
-    
-    print(f"Initial state: {initial_state.squeeze().numpy()}")
-    model.InitSequence(initial_state, better_m2x_0)
-    
-    # Run the model on all timesteps
-    predictions = []
-    encoder_outputs = []
-    
-    print("Running model inference...")
-    with torch.no_grad():
-        for i, data_point in enumerate(tqdm(processed_data)):
-            # Skip first observation (used for initialization)
-            if i == 0:
-                predictions.append(data_point['distance'])
-                encoder_outputs.append(data_point['distance'])
-                continue
-                
-            # Prepare model input
-            basic_features, summary_features = prepare_model_input(data_point)
-            
-            # Get model prediction
-            try:
-                state = model((basic_features, summary_features))
-                predictions.append(state[0, 0, 0].item())  # Extract distance
-                encoder_outputs.append(model.prev_distance)  # Store encoder output
-            except Exception as e:
-                print(f"Error at timestep {i}: {e}")
-                # Use previous prediction as fallback
-                if predictions:
-                    predictions.append(predictions[-1])
-                    encoder_outputs.append(encoder_outputs[-1])
-                else:
-                    predictions.append(data_point['distance'])
-                    encoder_outputs.append(data_point['distance'])
-    
-    # Calculate error metrics
-    predictions = np.array(predictions)
-    ground_truth = np.array(ground_truth_distances)
-    encoder_outputs = np.array(encoder_outputs)
-    
-    # MSE
-    mse = np.mean((predictions - ground_truth) ** 2)
-    rmse = np.sqrt(mse)
-    
-    encoder_mse = np.mean((encoder_outputs - ground_truth) ** 2)
-    encoder_rmse = np.sqrt(encoder_mse)
-    
-    print(f"Latent-KalmanNet - MSE: {mse:.2f}, RMSE: {rmse:.2f}")
-    print(f"Encoder Only - MSE: {encoder_mse:.2f}, RMSE: {encoder_rmse:.2f}")
-    
-    # Plot results
-    plt.figure(figsize=(12, 8))
-    plt.plot(timestamps, ground_truth, 'k-', linewidth=2, label='Ground Truth')
-    plt.plot(timestamps, predictions, 'b-', linewidth=2, label='Latent-KalmanNet')
-    plt.plot(timestamps, encoder_outputs, 'r--', linewidth=1.5, label='Encoder Only')
-    plt.xlabel('Timestamp')
-    plt.ylabel('Distance (m)')
-    plt.title(f'Alice Trajectory: Ground Truth vs Prediction\nLatent-KalmanNet RMSE: {rmse:.2f}m, Encoder RMSE: {encoder_rmse:.2f}m')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("long_trajectory_alice.png", dpi=300)
-    
-    # Plot the error over time
-    plt.figure(figsize=(12, 6))
-    knet_error = np.abs(predictions - ground_truth)
-    encoder_error = np.abs(encoder_outputs - ground_truth)
-    plt.plot(timestamps, knet_error, 'b-', label='Latent-KalmanNet Error')
-    plt.plot(timestamps, encoder_error, 'r--', label='Encoder Error')
-    plt.xlabel('Timestamp')
-    plt.ylabel('Absolute Error (m)')
-    plt.title('Absolute Error Over Time')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("error_over_time.png", dpi=300)
-    
-    print("Testing complete. Results saved to long_trajectory_alice.png and error_over_time.png")
+def build_traj_map(ds):
+    mp = {}
+    for i, d in enumerate(ds.all_data):
+        mp.setdefault(d["trajectory_id"], []).append(i)
+    return mp
 
-if __name__ == "__main__":
-    test_long_trajectory()
+def to_raw(norm, ds):  return (norm * ds.distance_std + ds.distance_mean) / KM
+def to_norm(km, ds):   return ((km * KM) - ds.distance_mean) / ds.distance_std
+
+# ───────── CLI ─────────
+pa = argparse.ArgumentParser()
+pa.add_argument("--csv", default="data/all_arrivals_long.csv")
+args = pa.parse_args()
+
+# ───────── 1. dataset & µ/σ on pseudo-train split ─────────
+ds = UnderwaterDataset("data")
+tids = list({d["trajectory_id"] for d in ds.all_data})
+random.Random(RNG_SEED).shuffle(tids)
+train_tids = tids[:int(TRAIN_RATIO * len(tids))]
+train_idx  = [i for tid in train_tids for i in build_traj_map(ds)[tid]]
+ds.compute_normalisation_stats(indices=train_idx)
+print(f"[stats] μ={ds.distance_mean:.1f} m  σ={ds.distance_std:.1f} m")
+
+# ───────── 2. models ─────────
+enc  = UnderwaterEncoderWithPrior().to(DEVICE)
+enc.load_state_dict(torch.load("saved_models/enc_finetuned.pth", map_location=DEVICE))
+knet = KalmanNetUnderwater().to(DEVICE)
+knet.Build(m=m, n=n, f_function=f_function, H=H.to(DEVICE))
+knet.load_state_dict(torch.load("saved_models/knet_best.pth", map_location=DEVICE))
+enc.eval(); knet.eval()
+
+# ───────── 3. read evaluation CSV & filter Alice → Apex ─────────
+csv = pd.read_csv(args.csv)
+csv = csv[(csv["Transmitter_Name"] == "Alice") & (csv["Sensor_ID"] == "Apex")]
+if csv.empty:
+    raise ValueError("No rows with Transmitter_Name='Alice' and Sensor_ID='Apex'")
+ts_list = sorted(csv["Timestamp"].unique())
+T = len(ts_list)
+print(f"[eval] trajectory length = {T} steps  (first ts={ts_list[0]})")
+
+# distance helper
+def dist_tx_rx(row):
+    dx = row["Transmitter_X(km)"] - row["Receiver_X(km)"]
+    dy = row["Transmitter_Y(km)"] - row["Receiver_Y(km)"]
+    dz = (row["Transmitter_Depth(m)"] - row["Receiver_Depth(m)"]) / 1000.0
+    return math.sqrt(dx*dx + dy*dy + dz*dz) * KM   # metres
+
+# per-step feature builder
+DELAY_COL = "Delay(s)"
+def proc_step(group):
+    amp = group["Amplitude"].values
+    dly = group[DELAY_COL].values
+    w   = np.abs(amp)**2
+    if w.sum() == 0 or np.abs(amp).sum() == 0:
+        raise ValueError("zero-power frame")
+    pw_avg = (w*dly).sum()/w.sum()
+    d_spread = math.sqrt(((w*(dly-pw_avg)**2).sum())/w.sum())
+    avg_path = (np.abs(amp)*dly).sum()/np.abs(amp).sum()
+    return dict(
+        basic=np.stack([(amp-ds.amplitude_mean)/ds.amplitude_std,
+                        (dly-ds.delay_mean   )/ds.delay_std   ], 1),
+        summary=np.array([len(amp), np.mean(np.abs(amp)), d_spread,
+                          avg_path, pw_avg], dtype=np.float32)
+    )
+
+frames, gt_list = [], []
+for ts in ts_list:
+    g = csv[csv["Timestamp"] == ts]
+    frames.append(proc_step(g))
+    gt_list.append(dist_tx_rx(g.iloc[0]))
+
+gt_m = np.array(gt_list)
+
+# ───────── 4. roll Latent-KalmanNet ─────────
+pred_m = []
+with torch.no_grad():
+    b0 = torch.tensor(frames[0]["basic"], dtype=torch.float32).to(DEVICE)
+    s0 = torch.tensor(frames[0]["summary"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+    tgt0_n = torch.tensor([(gt_m[0]-ds.distance_mean)/ds.distance_std], dtype=torch.float32).to(DEVICE)
+
+    z0_km = to_raw(enc((b0.unsqueeze(0),
+                        torch.ones(1,b0.size(0),dtype=torch.bool,device=DEVICE),
+                        s0), tgt0_n.unsqueeze(1)).squeeze(0), ds)
+    knet.InitSequence(torch.tensor([[z0_km.item()], [0.0]], device=DEVICE), m2x_0.to(DEVICE))
+    prev_pred_km = knet.m1x_posterior[:,0:1,0]
+    pred_m.append(z0_km.item()*KM)
+
+    for t in range(1, T):
+        b = torch.tensor(frames[t]["basic"], dtype=torch.float32).to(DEVICE)
+        s = torch.tensor(frames[t]["summary"], dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        z_km = to_raw(enc((b.unsqueeze(0),
+                           torch.ones(1,b.size(0),dtype=torch.bool,device=b.device),
+                           s), to_norm(prev_pred_km, ds)).squeeze(0), ds)
+        est = knet(z_km)
+        prev_pred_km = knet.m1x_prior[:,0:1,0]
+        pred_m.append(est[:,0,0].item()*KM)
+
+pred_m = np.array(pred_m)
+
+# ───────── 5. metrics & plot ─────────
+mae  = np.abs(pred_m-gt_m).mean()
+rmse = np.sqrt(((pred_m-gt_m)**2).mean())
+print(f"[eval] MAE  = {mae:.2f} m   RMSE = {rmse:.2f} m")
+
+plt.figure(figsize=(10,4))
+plt.plot(gt_m,  label="ground truth")
+plt.plot(pred_m, label="Latent-KalmanNet")
+plt.xlabel("timestep"); plt.ylabel("distance [m]"); plt.legend(); plt.tight_layout()
+out = PLOT_DIR/"long_traj.png"; plt.savefig(out)
+print(f"[eval] plot saved → {out}")
+plt.figure(figsize=(10,4))
+plt.plot(gt_m, color="steelblue")
+plt.xlabel("timestep"); plt.ylabel("ground-truth distance  [m]")
+plt.title("Ground-truth trajectory (Alice → Apex)")
+plt.tight_layout()
+out_gt = PLOT_DIR / "long_traj_ground_truth_only.png"
+plt.savefig(out_gt)
+print(f"[eval] ground-truth plot saved → {out_gt}")

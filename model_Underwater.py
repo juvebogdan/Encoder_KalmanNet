@@ -1,42 +1,35 @@
 import torch
-import numpy as np
+import math
 
-# System dimensions
-m = 2  # State dimensions (distance, velocity)
-n = 1  # Observation dimension (distance estimate from encoder)
+# ───────────── units ─────────────
+KM = 1e3              # 1 km = 1000 m
+delta_t_sec = 1.0     # sampling period in seconds
+delta_t = delta_t_sec / KM   # → 0.001 km per second
 
-# Initial state mean and covariance
-m1x_0 = torch.zeros(m, 1)  # Will be set during initialization with first observation
-m2x_0 = 0.1 * torch.eye(m)  # Initial uncertainty
+# ───────────── system dimensions ─────────────
+m = 2   # [distance (km), velocity (km/s)]
+n = 1   # learned scalar measurement (km)
 
-# Time step
-delta_t = 1.0  # Update based on your data sampling rate
+# ───────────── initial state (will be overwritten at run-time) ─────────────
+m1x_0 = torch.zeros(m, 1)          # km, km/s
+m2x_0 = 0.1 * torch.eye(m)         # broad covariance
 
-# Observation matrix (used by KalmanNet architecture)
-H = torch.tensor([[1.0, 0.0]])  # Only extract distance from state
+# ───────────── constant matrices ─────────────
+H = torch.tensor([[1.0, 0.0]])     # observe distance only (km)
 
-# Parameters for the model
-real_q2 = 0.01  # Process noise variance
-y_size = 2      # Size of basic observation (amplitude, delay)
-d = 1           # Dimension of encoder output (distance estimate)
+# process-noise variance in km²
+real_q2 = 0.01 / KM**2             # was 0.01 m² → now 1.0 e-8 km²
 
-def f_function(x_prev):
+# ───────────── transition function ─────────────
+def f_function(x_prev: torch.Tensor) -> torch.Tensor:
     """
-    State transition function for constant velocity model.
-    x_prev: Previous state [distance, velocity]
-    Returns: State transition matrix F
+    Return the constant transition matrix F (2×2) on the same device
+    as x_prev.  Ignoring x_prev because our model is linear time-invariant.
     """
-    # Constant velocity model
-    F = torch.tensor([
-        [1.0, delta_t],  # distance = distance + velocity*delta_t
-        [0.0, 1.0]       # velocity = velocity (constant)
-    ], dtype=torch.float32)
-    
-    return F
+    return torch.tensor([[1.0, delta_t],
+                         [0.0, 1.0]], dtype=torch.float32, device=x_prev.device)
 
-def h_function(state):
-    """
-    Simple observation function - extracts distance component
-    (Only used for architecture compatibility)
-    """
-    return state[0].item()  # Return only the distance component
+# ───────────── (optional) linear observation for reference ─────────────
+def h_function(x: torch.Tensor) -> torch.Tensor:
+    """Return the expected measurement (distance in km)."""
+    return x[0:1]  # first row = distance component
