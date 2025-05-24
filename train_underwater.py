@@ -18,6 +18,7 @@ PLOT_DIR = Path("plots"); PLOT_DIR.mkdir(exist_ok=True)
 EPOCHS, LR, NOISE_LEVEL, TRAJ_BATCH = 40, 3e-3, 0.1, 4
 PRINT_EVERY, TRAIN_RATIO, VAL_RATIO = 100, 0.7, 0.15
 RNG_SEED = 42
+stats_filename = SAVE_DIR / "encoder_normalization_stats.npz"
 print(f"[train-seq] device = {DEVICE}\n")
 
 # ───────────────────── visualisation utils ─────────────────────
@@ -136,6 +137,31 @@ if __name__ == "__main__":
     train_idx = [i for tid in tr_tids for i in build_traj_map(ds)[tid]]
     ds.compute_normalisation_stats(indices=train_idx)
     print(f"[split] {len(tr_tids)} train | {len(val_tids)} val | {len(te_tids)} test\n")
+
+    # Save all the normalization parameters
+    np.savez(stats_filename,
+        # Distance normalization (what the encoder predicts)
+        distance_mean=ds.distance_mean,
+        distance_std=ds.distance_std,
+        
+        # Input feature normalization
+        amplitude_mean=ds.amplitude_mean,
+        amplitude_std=ds.amplitude_std,
+        delay_mean=ds.delay_mean,
+        delay_std=ds.delay_std,
+        
+        # Summary statistics normalization
+        summary_means=ds.summary_means,  # This is an array of 5 values
+        summary_stds=ds.summary_stds,    # This is an array of 5 values
+        
+        # Also save metadata for verification
+        num_train_samples=len(train_idx),
+        train_trajectory_ids=tr_tids  # So we can verify same split if needed
+    )
+
+    print(f"[IMPORTANT] Normalization stats saved to: {stats_filename}")
+    print(f"  Distance: mean={ds.distance_mean:.1f}m, std={ds.distance_std:.1f}m")
+
     # ───── baseline: always predict training-set mean distance ─────
     traj_map   = build_traj_map(ds)
     test_idx   = [i for tid in te_tids for i in traj_map[tid]]

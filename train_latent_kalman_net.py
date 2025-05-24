@@ -27,8 +27,8 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RNG_SEED     = 42
 TRAIN_RATIO, VAL_RATIO = 0.7, 0.15
 
-ENC_EPOCHS, ENC_LR, ENC_SIGMA = 20, 3e-3, 0.1             # Phase-A
-KNET_EPOCHS, KNET_LR         = 30, 3e-4                   # Phase-B  (↓ LR)
+ENC_EPOCHS, ENC_LR, ENC_SIGMA, ENC_ACCUMULATION_TRAJ = 40, 3e-3, 0.1, 4             # Phase-A
+KNET_EPOCHS, KNET_LR         = 20, 3e-4                   # Phase-B  (↓ LR)
 FT_EPOCHS                    = 10                         # Phase-C
 CLIP_NORM                    = 10.0                       # grad-clip
 HEARTBEAT                    = 50                         # print every N traj
@@ -52,28 +52,81 @@ to_raw  = lambda norm, ds: (norm * ds.distance_std + ds.distance_mean) / KM     
 to_norm = lambda km,   ds: ((km * KM) - ds.distance_mean) / ds.distance_std          # → z-score
 
 # ─────────── Phase-A : encoder warm-up (normalised) ───────────
-def train_encoder(enc, ds, tr, val, save):
-    mse = nn.MSELoss(); opt = optim.AdamW(enc.parameters(), lr=ENC_LR, weight_decay=1e-2)
-    best = float("inf"); tm = build_traj_map(ds)
+def train_encoder(enc, ds, tr, val, save, accumulation_steps=4):
+    """
+    Train encoder with gradient accumulation support.
+    
+    Args:
+        accumulation_steps: Number of trajectories to process before updating weights.
+                           Set to 1 for original behavior (update after each trajectory).
+                           Set to 4 to match train_underwater.py behavior.
+    """
+    mse = nn.MSELoss()
+    opt = optim.AdamW(enc.parameters(), lr=ENC_LR, weight_decay=1e-2)
+    best = float("inf")
+    tm = build_traj_map(ds)
+    
     for ep in range(1, ENC_EPOCHS+1):
         print(f"\n[ENC] epoch {ep}/{ENC_EPOCHS} – {len(tr)} trajectories")
-        enc.train(); random.shuffle(tr); run = seen = 0
-        for tid in tr:
-            opt.zero_grad(); loss_t = 0.0
+        enc.train()
+        random.shuffle(tr)
+        
+        # Initialize accumulation tracking
+        accumulated_loss = 0.0
+        trajectories_in_batch = 0
+        running_loss = 0.0
+        trajectories_seen = 0
+        
+        # Important: Clear gradients at start
+        opt.zero_grad()
+        
+        for i, tid in enumerate(tr):
+            # Process one trajectory
+            loss_t = 0.0
             for idx in tm[tid]:
                 (basic, summary), tgt_n = ds[idx]
                 prior_n = make_noisy(tgt_n, ENC_SIGMA).unsqueeze(1).to(DEVICE)
                 out = enc((basic.unsqueeze(0).to(DEVICE),
-                           torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
-                           summary.unsqueeze(0).to(DEVICE)), prior_n)
+                          torch.ones(1,basic.size(0),dtype=torch.bool,device=DEVICE),
+                          summary.unsqueeze(0).to(DEVICE)), prior_n)
                 loss_t += mse(out, tgt_n.to(DEVICE).view_as(out))
-            (loss_t/len(tm[tid])).backward(); opt.step()
-            run += loss_t.item(); seen += 1
-            if seen % HEARTBEAT == 0:
-                print(f"    …{seen}/{len(tr)} traj, running loss {run/seen:.3e}")
-        val_mse = evaluate_encoder(enc, ds, val);              # below
+            
+            # Average loss for this trajectory
+            trajectory_avg_loss = loss_t / len(tm[tid])
+            
+            # Scale by 1/accumulation_steps to maintain same effective learning rate
+            # This is crucial - without this, larger batches would have larger gradients
+            scaled_loss = trajectory_avg_loss / accumulation_steps
+            
+            # Accumulate gradients (backward pass adds to existing gradients)
+            scaled_loss.backward()
+            
+            # Track for logging
+            accumulated_loss += trajectory_avg_loss.item()
+            trajectories_in_batch += 1
+            running_loss += trajectory_avg_loss.item()
+            trajectories_seen += 1
+            
+            # Check if we should update weights
+            if trajectories_in_batch == accumulation_steps or i == len(tr) - 1:
+                # Perform optimization step
+                opt.step()
+                opt.zero_grad()
+                
+                # Reset batch tracking
+                trajectories_in_batch = 0
+                accumulated_loss = 0.0
+            
+            # Progress logging
+            if trajectories_seen % HEARTBEAT == 0:
+                avg_running = running_loss / trajectories_seen
+                print(f"    …{trajectories_seen}/{len(tr)} traj, running loss {avg_running:.3e}")
+        
+        # Validation
+        val_mse = evaluate_encoder(enc, ds, val)
         if val_mse < best:
-            best = val_mse; torch.save(enc.state_dict(), save/"best_encoder_seq.pth")
+            best = val_mse
+            torch.save(enc.state_dict(), save/"best_encoder_seq.pth")
         print(f"[ENC] epoch {ep} done | val {val_mse:.3e}{' *' if val_mse==best else ''}")
 
 def evaluate_encoder(enc, ds, tids):
@@ -259,7 +312,8 @@ def main():
 
     if not pretrained or args.force_pretrain:
         print("\n==== Phase-A : encoder warm-up ====")
-        train_encoder(enc, ds, tr_tids, val_tids, save)
+        train_encoder(enc, ds, tr_tids, val_tids, save, 
+                    accumulation_steps=ENC_ACCUMULATION_TRAJ)  # Pass the parameter
         enc.load_state_dict(torch.load(save/"best_encoder_seq.pth", map_location=DEVICE))
     else:
         print("\n[skip] Phase-A")
